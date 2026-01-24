@@ -1,0 +1,39 @@
+# --- PYTORCH NIGHTLY (CUDA 12.8) ---
+--extra-index-url https://download.pytorch.org/whl/nightly/cu128
+torch
+torchvision
+torchaudio
+
+# --- TRITON (KHUSUS WINDOWS & PYTHON 3.12) ---
+# Link langsung ke file .whl (bukan hasil search google)
+https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post5/triton-3.1.0-cp312-cp312-win_amd64.whl
+
+# --- LIBRARY UTAMA SAM 3 ---
+numpy==1.26.4
+opencv-python
+pillow
+matplotlib
+tqdm
+huggingface_hub
+scipy
+pandas
+
+# --- MODUL TAMBAHAN ---
+einops
+decord
+psutil
+timm
+hydra-core
+submitit
+fairscale
+pycocotools
+
+# --- DASHBOARD & AI TOOLS ---
+streamlit
+supervision
+deep-translator
+ffmpeg-python
+google-genai
+
+# --- INSTALL CURRENT REPO (EDITABLE MODE) ---
+-e .
