@@ -6,7 +6,36 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C.svg)](https://pytorch.org/)
 [![SAM3](https://img.shields.io/badge/SAM3-ICLR_2026-10b981.svg)](https://openreview.net/pdf/c01d0dd8d4e7179b0952062eff08eb52c8d8c322.pdf)
 
-**EcoPower Roof** is a scalable geospatial AI framework for urban rooftop solar potential assessment. It integrates hierarchical deep learning segmentation via SAM3, techno-economic modeling, AHP-weighted multi-criteria decision analysis (MCDA), and an LLM-assisted planning dashboard — bridging the gap between complex geospatial outputs and actionable urban energy policy for Indonesian municipalities.
+> Built on [SAM3](https://github.com/facebookresearch/sam3) by Meta AI Research —
+> a unified, promptable segmentation model supporting language, exemplar, and visual
+> prompts across images and videos (ICLR 2026).
+
+**EcoPower Roof** is a scalable geospatial AI framework for urban rooftop solar potential
+assessment. It integrates hierarchical deep learning segmentation via SAM3, techno-economic
+modeling, AHP-weighted multi-criteria decision analysis (MCDA), and an LLM-assisted planning
+dashboard — bridging the gap between complex geospatial outputs and actionable urban energy
+policy for Indonesian municipalities.
+
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [Framework Architecture](#framework-architecture)
+- [Technology Stack](#technology-stack)
+- [Project Structure](#project-structure)
+- [Installation](#installation)
+- [SAM3 Model Setup](#sam3-model-setup)
+- [Usage Guide](#usage-guide)
+- [Model Performance](#model-performance)
+- [Case Study Results](#case-study-results)
+- [Configuration](#configuration)
+- [Deployment](#deployment)
+- [Team](#team)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+---
 
 ---
 
@@ -174,6 +203,111 @@ EcoPower-Roof/
 - CUDA-capable GPU (recommended; CPU mode supported)
 - Google Gemini API Key
 - 8 GB+ RAM recommended
+
+## SAM3 Model Setup
+
+EcoPower Roof depends on the official SAM3 package from Meta AI Research.
+The steps below must be completed **before** running the application.
+
+### Step 1 — Clone the Official SAM3 Repository
+
+```bash
+git clone https://github.com/facebookresearch/sam3.git
+cd sam3
+```
+
+### Step 2 — Install SAM3 as a Local Package
+
+```bash
+# Install in editable mode so EcoPower Roof can import it directly
+pip install -e .
+```
+
+This registers the `sam3` package into your Python environment.
+After this step, `from sam3 import build_sam3` will resolve correctly
+from anywhere in the EcoPower Roof project.
+
+### Step 3 — Download Model Weights
+
+Place the checkpoint in the EcoPower Roof project root as `sam3.pt`:
+
+```bash
+# Run from the EcoPower Roof project root
+wget -O sam3.pt https://dl.fbaipublicfiles.com/sam3/sam3.pt
+```
+
+| File | Size | Purpose |
+|---|---|---|
+| `sam3.pt` | ~2.4 GB | Default checkpoint used by EcoPower Roof |
+
+### Step 4 — Verify Installation
+
+```python
+import torch
+from sam3 import build_sam3
+
+model = build_sam3(checkpoint="sam3.pt")
+model.eval()
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+print(f"SAM3 loaded successfully on: {device}")
+```
+
+**Expected output:**
+```
+SAM3 loaded successfully on: cuda
+```
+
+---
+
+### How EcoPower Roof Uses SAM3
+
+Once loaded, imagery is passed through the full SAM3 Advanced inference pipeline:
+
+```
+Aerial / Satellite Image (PNG or GeoTIFF)
+        |
+        v
+[ sam3_advanced/inference.py ]        — SAM3 automatic mask generation
+        |
+        v
+[ sam3_advanced/filtering.py ]        — Class separation: rooftop vs. PV
+        |
+        v
+[ sam3_advanced/postprocess.py ]      — Morphological refinement + area filtering
+        |
+        v
+[ sam3_advanced/patching.py ]         — Tile-based processing for large images
+        |
+        v
+[ sam3_advanced/geotiff_utils.py ]    — Pixel mask -> real-world area (m2)
+        |
+        v
+[ solar_calculator/usable_area_suitability.py ]   — Reduction cascade
+        |
+        v
+[ solar_calculator/economics.py ]     — NPV / LCOE / ROI computation
+        |
+        v
+[ solar_calculator/spatial_recommendation.py ]    — AHP-MCDA prioritization
+        |
+        v
+[ solar_calculator/analysis.py ]      — Gemini AI six-section report
+        |
+        v
+  Streamlit Dashboard Output
+```
+
+### Inference Parameters
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `points_per_side` | 32 | Grid density for automatic prompt generation |
+| `pred_iou_thresh` | 0.88 | Minimum predicted IoU to retain a mask |
+| `stability_score_thresh` | 0.95 | Mask stability filter across threshold range |
+| `min_mask_region_area` | 100 | Removes sub-threshold pixel regions |
 
 ### Steps
 
@@ -454,10 +588,13 @@ Yogyakarta, Indonesia
 
 ## Acknowledgments
 
-- **Meta AI** — SAM3: Segment Anything Model 3 (ICLR 2026)
-- **Google** — Gemini AI API
+- **Meta AI Research** — [SAM3: Segment Anything Model 3](https://github.com/facebookresearch/sam3),
+  a unified promptable segmentation model presented at ICLR 2026.
+  EcoPower Roof is built directly on top of the SAM3 backbone for all
+  rooftop and PV patch segmentation tasks.
+- **Google** — Gemini AI API for LLM-assisted planning narrative generation
 - **Streamlit** — Web application framework
-- **World Bank Group & Solargis** — Global Solar Atlas 2.0
+- **World Bank Group & Solargis** — Global Solar Atlas 2.0 irradiance data
 - **Universitas Gadjah Mada** — Institutional and academic support
 
 ---
