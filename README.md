@@ -444,11 +444,12 @@ Yogyakarta, Indonesia
 
 | Name | Role |
 |---|---|
+| Ruli Andaru | Researcher |
 | Mohammad Zulfi Rahadi Putra | Researcher |
 | Raffi Satya Nugraha | Researcher |
-| Najieda Azka | Researcher |
-| Salzabila Enzal Putri | Researcher |
-
+| Fairuz Akmal Pradana | Researcher |
+| Hyatma Adikara Ajrin | Researcher |
+| Fikri Kurniawan | Researcher |
 ---
 
 ## Acknowledgments
