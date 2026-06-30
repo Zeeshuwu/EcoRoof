@@ -16,7 +16,7 @@ modeling, AHP-weighted multi-criteria decision analysis (MCDA), and an LLM-assis
 dashboard — bridging the gap between complex geospatial outputs and actionable urban energy
 policy for Indonesian municipalities.
 
-For full setup, configuration, and deployment instructions, see [TECHNICAL.md](TECHNICAL.md).
+For full setup, configuration, and deployment instructions, see [TECHNICAL.md](Technical.md).
 
 ---
 
