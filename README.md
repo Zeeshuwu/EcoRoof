@@ -119,7 +119,7 @@ deployment, and module-level documentation, refer to [TECHNICAL.md](TECHNICAL.md
 
 ### Rooftop Detection & PV Segmentation
 
-![Rooftop and PV Detection](docs/images/Rooftop_PV_image.png)
+![Rooftop and PV Detection](docs/images/Rooftop_PV_Image.png)
 
 *SAM3-based multi-scale rooftop boundary segmentation on aerial imagery*
 *Existing solar panel identification with coverage area metrics*
