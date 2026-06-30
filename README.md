@@ -102,11 +102,12 @@ EcoPower Roof
 
 ## How It Works
 
-The diagram below illustrates the end-to-end hierarchical pipeline — from raw aerial
+The diagram below illustrates the end-to-end hierarchical pipeline from raw aerial
 imagery input through SAM3 patch segmentation, techno-economic modeling, AHP-MCDA
 spatial prioritization, and finally LLM-assisted planning report generation.
 
 ![EcoPower Roof — Hierarchical Pipeline Diagram](docs/images/pipeline_diagram.png)
+
 *End-to-end hierarchical workflow: SAM3 segmentation → techno-economic modeling → AHP-MCDA prioritization → LLM planning output*
 
 For a detailed technical walkthrough of each pipeline stage, including configuration,
@@ -118,7 +119,8 @@ deployment, and module-level documentation, refer to [TECHNICAL.md](TECHNICAL.md
 
 ### Rooftop Detection & PV Segmentation
 
-![Rooftop and PV Detection](docs/images/Rooftop and PV_image.png)
+![Rooftop and PV Detection](docs/images/Rooftop_PV_image.png)
+
 *SAM3-based multi-scale rooftop boundary segmentation on aerial imagery*
 *Existing solar panel identification with coverage area metrics*
 
@@ -127,6 +129,7 @@ deployment, and module-level documentation, refer to [TECHNICAL.md](TECHNICAL.md
 ### Energy & Economic Analysis
 
 ![Energy Dashboard](docs/images/energy_dashboard.png)
+
 *Annual energy yield, self-sufficiency ratio, and financial projections*
 
 ---
@@ -134,6 +137,7 @@ deployment, and module-level documentation, refer to [TECHNICAL.md](TECHNICAL.md
 ### MCDA Spatial Prioritization Map
 
 ![MCDA Map](docs/images/mcda_prioritization.png)
+
 *AHP-weighted prioritization tiers across assessed rooftop sites*
 
 ---
@@ -141,6 +145,7 @@ deployment, and module-level documentation, refer to [TECHNICAL.md](TECHNICAL.md
 ### LLM Planning Report
 
 ![LLM Report](docs/images/llm_report.png)
+
 *Gemini AI-generated six-section structured planning narrative*
 
 ---
