@@ -36,6 +36,9 @@ PANEL_EFFICIENCY     = 0.20
 PERFORMANCE_RATIO    = 0.80
 
 # W/m² standard (IEA PVPS 2024)
+# A third, independent value for the draft's P_D (see models.PANEL_EFFICIENCY).
+# Kept at 200 W/m2 so existing district figures reproduce; for a datasheet-backed
+# number use models.power_density_kwp_m2(code) * 1000 (R3-2 gives 194-211 W/m2).
 PANEL_WATT_PER_M2    = 200.0
 
 

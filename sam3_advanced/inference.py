@@ -17,7 +17,9 @@ def segment_with_prompts(image_pil: Image.Image,
                         processor,
                         prompts: List[str],
                         conf_threshold: float,
-                        verbose: bool = True) -> Tuple[List[np.ndarray], List[float]]:
+                        verbose: bool = True,
+                        sink: list = None,
+                        sink_meta: dict = None) -> Tuple[List[np.ndarray], List[float]]:
     """
     Segment image with multiple prompts using YOUR processor interface
     
@@ -27,6 +29,11 @@ def segment_with_prompts(image_pil: Image.Image,
         prompts: List of text prompts
         conf_threshold: Confidence threshold
         verbose: Print progress
+        sink: optional list (revision R2, default None = old behaviour). When
+              given, EVERY instance returned by the processor is appended to it
+              (before conf_threshold filtering) as a cropped record, so that
+              thresholds can be recalibrated offline without re-running SAM3.
+        sink_meta: extra fields copied into each sink record (level, patch bbox)
     
     Returns:
         (list_of_masks, list_of_confidences)
@@ -61,6 +68,10 @@ def segment_with_prompts(image_pil: Image.Image,
                     else:
                         scores_np = np.array(scores)
                     
+                    if sink is not None:
+                        _sink_instances(sink, masks_np, scores_np, idx - 1,
+                                        sink_meta or {})
+
                     # Filter by confidence
                     for i in range(len(masks_np)):
                         if scores_np[i] >= conf_threshold:
@@ -79,9 +90,31 @@ def segment_with_prompts(image_pil: Image.Image,
     return all_masks, all_confs
 
 
+def _sink_instances(sink, masks_np, scores_np, prompt_idx, meta):
+    """Append each instance mask as a bbox crop (revision R2 helper)."""
+    for i in range(len(masks_np)):
+        m = masks_np[i]
+        if m.ndim == 3:
+            m = m.squeeze()
+        m = m > 0.5
+        ys = np.flatnonzero(m.any(axis=1))
+        xs = np.flatnonzero(m.any(axis=0))
+        if len(ys) == 0:
+            y0 = x0 = 0
+            crop = np.zeros((0, 0), bool)
+        else:
+            y0, y1, x0, x1 = ys[0], ys[-1] + 1, xs[0], xs[-1] + 1
+            crop = m[y0:y1, x0:x1].copy()
+        rec = dict(meta)
+        rec.update(prompt_idx=int(prompt_idx), score=float(scores_np[i]),
+                   y0=int(y0), x0=int(x0), crop=crop)
+        sink.append(rec)
+
+
 def segment_multiscale_advanced(image_pil: Image.Image,
                                 processor,
-                                config: AdvancedConfig) -> Tuple[np.ndarray, Dict]:
+                                config: AdvancedConfig,
+                                return_levels: bool = False):
     """
     Multiscale segmentation with 3 levels
     
@@ -90,9 +123,20 @@ def segment_multiscale_advanced(image_pil: Image.Image,
         processor: Sam3Processor instance (YOUR interface)
         config: AdvancedConfig instance
     
+        return_levels: revision R2 option, default False (old behaviour and
+            return signature unchanged). When True returns
+            (final_mask, stats, levels) where `levels` holds the per-level masks
+            BEFORE merging (level1_binary, level2_merged, level2_validated,
+            level3_merged, level3_validated), every processor instance with
+            its score (`instances`, bbox-cropped) and per-level wall time.
+    
     Returns:
-        (final_mask, statistics_dict)
+        (final_mask, statistics_dict)  or  (final_mask, stats, levels)
     """
+    import time as _time
+    sink = [] if return_levels else None
+    timing = {}
+    _t = _time.time()
     print("="*70)
     print("🔍 MULTISCALE INFERENCE - ADVANCED MODE")
     print("="*70)
@@ -118,7 +162,8 @@ def segment_multiscale_advanced(image_pil: Image.Image,
 
     level1_masks, level1_confs = segment_with_prompts(
         image_pil, processor, config.prompts_large,
-        config.confidence_thresholds['level1']
+        config.confidence_thresholds['level1'],
+        sink=sink, sink_meta={'level': 1, 'bbox': (0, 0, width, height)}
     )
 
     # Combine Level 1 masks
@@ -144,6 +189,8 @@ def segment_multiscale_advanced(image_pil: Image.Image,
     print(f"  ✅ Level 1: {len(level1_masks)} masks, {coverage_l1:.1f}% coverage")
 
     clear_memory()
+    timing['level1_s'] = _time.time() - _t
+    _t = _time.time()
 
     # ============================================
     # LEVEL 2: 512px PATCHES (Medium objects)
@@ -176,7 +223,8 @@ def segment_multiscale_advanced(image_pil: Image.Image,
 
         patch_masks, patch_confs = segment_with_prompts(
             patch_img_pil, processor, config.prompts_medium,
-            config.confidence_thresholds['level2'], verbose=False
+            config.confidence_thresholds['level2'], verbose=False,
+            sink=sink, sink_meta={'level': 2, 'bbox': patch_info['bbox']}
         )
 
         if len(patch_masks) > 0:
@@ -228,6 +276,9 @@ def segment_multiscale_advanced(image_pil: Image.Image,
     print(f"  ✅ Level 2: {coverage_l2:.1f}% coverage")
 
     clear_memory()
+    timing['level2_s'] = _time.time() - _t
+    _t = _time.time()
+    level3_merged = None
 
     # ============================================
     # LEVEL 3: 256px PATCHES (Small objects)
@@ -266,7 +317,8 @@ def segment_multiscale_advanced(image_pil: Image.Image,
 
             patch_masks, patch_confs = segment_with_prompts(
                 patch_img_pil, processor, config.prompts_small,
-                config.confidence_thresholds['level3'], verbose=False
+                config.confidence_thresholds['level3'], verbose=False,
+                sink=sink, sink_meta={'level': 3, 'bbox': patch_info['bbox']}
             )
 
             if len(patch_masks) > 0:
@@ -331,5 +383,19 @@ def segment_multiscale_advanced(image_pil: Image.Image,
 
     final_coverage = calculate_coverage(final_mask)
     print(f"  ✅ Merged coverage: {final_coverage:.2f}%")
+
+    if return_levels:
+        timing['level3_s'] = _time.time() - _t
+        levels = {
+            'level1_binary': level1_binary,
+            'level2_merged': level2_merged,
+            'level2_validated': level2_validated,
+            'level3_merged': level3_merged,
+            'level3_validated': level3_validated,
+            'level3_skipped': level3_merged is None,
+            'instances': sink,
+            'timing': timing,
+        }
+        return final_mask, stats, levels
 
     return final_mask, stats

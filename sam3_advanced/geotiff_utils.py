@@ -2,10 +2,12 @@
 GeoTIFF utilities for accurate geospatial measurements
 """
 
+import os
+import warnings
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 from PIL import Image
-from typing import Tuple, Dict, Optional
-import warnings
 
 try:
     import rasterio
@@ -19,8 +21,12 @@ except ImportError:
 class GeoTIFFHandler:
     """Handle GeoTIFF files and extract geospatial metadata"""
     
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, display_name: Optional[str] = None):
         self.file_path = file_path
+        # Original name of the source raster. Uploads are copied to a tempfile, so
+        # without this the site is always reported as "Analysis Zone" and the DEM
+        # crop has no site name to write.
+        self.filename = display_name or os.path.basename(file_path)
         self.metadata = {}
         self.is_geotiff = False
         self.pixel_size_x = None
@@ -28,9 +34,20 @@ class GeoTIFFHandler:
         self.crs = None
         self.bounds = None
         self.transform = None
+        self.lat_center = None
+        self.lon_center = None
 
         if RASTERIO_AVAILABLE:
             self._load_metadata()
+
+    @classmethod
+    def from_path(cls, path: str) -> "GeoTIFFHandler":
+        """Open a raster already on disk, keeping its real filename.
+
+        Used by the site picker so `input/01 DATA/IMAGE/JKT_ROOF.tif` keeps the name
+        `JKT_ROOF` all the way through to `input/01 DATA/DEM/JKT_ROOF_DEM.tif`.
+        """
+        return cls(path)
     
     def _load_metadata(self):
         """Load GeoTIFF metadata using rasterio"""
@@ -49,10 +66,23 @@ class GeoTIFFHandler:
                     self.pixel_size_y = abs(src.transform.e)  # metres/pixel Y
                     self.bounds       = src.bounds
 
+                    # Geographic centre, needed by the slope/orientation model and
+                    # by anything that wants to place the site on a map.
+                    try:
+                        from rasterio.warp import transform_bounds
+                        west, south, east, north = transform_bounds(
+                            src.crs, "EPSG:4326", *src.bounds
+                        )
+                        self.lon_center = (west + east) / 2.0
+                        self.lat_center = (south + north) / 2.0
+                    except Exception as exc:
+                        print(f"WARNING: could not derive lat/lon centre: {exc}")
+
                     self.metadata = {
                         'width':        src.width,
                         'height':       src.height,
                         'crs':          src.crs.to_string(),
+                        'filename':     self.filename,
                         'pixel_size_x': self.pixel_size_x,
                         'pixel_size_y': self.pixel_size_y,
                         'gsd':          (self.pixel_size_x + self.pixel_size_y) / 2,
@@ -62,21 +92,29 @@ class GeoTIFFHandler:
                             'right':  self.bounds.right,
                             'top':    self.bounds.top,
                         },
+                        # Flat tuple form. district_analysis.py reads metadata['bbox']
+                        # and silently got None before this existed.
+                        'bbox': (
+                            self.bounds.left, self.bounds.bottom,
+                            self.bounds.right, self.bounds.top,
+                        ),
+                        'lat_center': self.lat_center,
+                        'lon_center': self.lon_center,
                         'area_m2': (
                             (self.bounds.right - self.bounds.left) *
                             (self.bounds.top   - self.bounds.bottom)
                         ),
                     }
 
-                    print(f"✅ GeoTIFF detected!")
+                    print("GeoTIFF detected:")
                     print(f"   CRS      : {src.crs.to_string()}")
                     print(f"   Transform: {src.transform}")
                     print(f"   GSD      : {self.metadata['gsd']:.4f} m/pixel")
 
         except RasterioIOError:
-            print("⚠️ Not a valid GeoTIFF or no geospatial data")
+            print("WARNING: not a valid GeoTIFF or no geospatial data")
         except Exception as e:
-            print(f"⚠️ Error reading GeoTIFF: {e}")
+            print(f"WARNING: error reading GeoTIFF: {e}")
 
     def get_pixel_to_meter_ratio(self) -> Optional[float]:
         """Get automatic pixel-to-meter ratio from GeoTIFF"""
@@ -126,13 +164,14 @@ class GeoTIFFHandler:
                     return Image.fromarray(gray).convert("RGB")
         
         except Exception as e:
-            print(f"⚠️ Error loading GeoTIFF as image: {e}")
+            print(f"WARNING: error loading GeoTIFF as image: {e}")
             return Image.open(self.file_path).convert("RGB")
     
     def get_info_dict(self) -> Dict:
         """Get all metadata as dictionary"""
         return {
             'is_geotiff': self.is_geotiff,
+            'filename': self.filename,
             'metadata': self.metadata if self.is_geotiff else {},
             'pixel_to_meter': self.get_pixel_to_meter_ratio()
         }
@@ -156,12 +195,12 @@ def load_image_with_geotiff_support(uploaded_file) -> Tuple[Image.Image, Optiona
     # Try to load as GeoTIFF
     if RASTERIO_AVAILABLE and uploaded_file.name.lower().endswith(('.tif', '.tiff')):
         try:
-            handler = GeoTIFFHandler(tmp_path)
+            handler = GeoTIFFHandler(tmp_path, display_name=uploaded_file.name)
             if handler.is_geotiff:
                 image_pil = handler.get_image_as_pil()
                 return image_pil, handler
         except Exception as e:
-            print(f"⚠️ Failed to load as GeoTIFF: {e}")
+            print(f"WARNING: failed to load as GeoTIFF: {e}")
     
     # Fallback to regular PIL
     image_pil = Image.open(uploaded_file).convert("RGB")

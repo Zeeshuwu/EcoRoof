@@ -11,6 +11,7 @@ Date   : June 2026
 
 import io
 import json
+import os
 
 import cv2
 import numpy as np
@@ -29,7 +30,11 @@ from sam3_advanced.config import AdvancedConfig
 from sam3_advanced.inference import segment_multiscale_advanced
 from sam3_advanced.postprocess import post_process_mask
 from sam3_advanced.utils import clear_memory, get_gpu_memory
-from sam3_advanced.geotiff_utils import load_image_with_geotiff_support, RASTERIO_AVAILABLE
+from sam3_advanced.geotiff_utils import (
+    GeoTIFFHandler,
+    load_image_with_geotiff_support,
+    RASTERIO_AVAILABLE,
+)
 
 # ── Solar Calculator ─────────────────────────────────────────────────────────
 from solar_calculator.models import (
@@ -97,6 +102,27 @@ from solar_calculator.spatial_recommendation import (
     AHP_WEIGHTS,
     RECOMMENDATION_COLORS,
 )
+# ── R3-2: module-specific power output ───────────────────────────────────────
+from solar_calculator.pv_modules import (
+    DEFAULT_COMPARISON,
+    MODULES,
+    catalogue_issues,
+    citation,
+    get_module,
+)
+from solar_calculator.module_yield import (
+    OBJECTIVES,
+    YieldAssumptions,
+    annual_energy_series,
+    best_modules,
+    compare_modules,
+    h_poa_from_psh,
+    packing_sensitivity,
+    skipped_for_bin,
+    spread_summary,
+)
+# ── R3-3: roof slope and orientation (limitation) ────────────────────────────
+from solar_calculator import dem_slope
 
 import pandas as pd
 
@@ -121,6 +147,8 @@ def _load_css():
 
 _load_css()
 
+SITE_IMAGE_DIR = os.path.join("input", "01 DATA", "IMAGE")
+
 # ============================================================================
 # SESSION STATE
 # ============================================================================
@@ -134,6 +162,10 @@ _defaults = {
     "analysis_results":  None,
     "chat_history":      [],
     "geotiff_handler":   None,
+    # R3-2 / R3-3 state
+    "site_image_path":  None,   # real path when a site is picked from input/01 DATA/IMAGE
+    "dem_provenance":   None,   # dict returned by dem_slope.crop_dem_for_image
+    "module_table":     None,   # cached IV.B comparison DataFrame
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -152,6 +184,34 @@ def load_sam3_model(checkpoint_path: str = "sam3.pt"):
     except Exception as exc:
         st.error(f"SAM3 load error: {exc}")
         return None, None
+
+
+# -- R3-2 / R3-3 cached helpers ----------------------------------------------
+# Pure functions of their arguments, so caching keeps tab switching snappy without
+# holding any raster in memory.
+
+@st.cache_data(show_spinner=False)
+def _cached_orientation(lat: float, tilts: tuple, diffuse_fraction: float):
+    """Tilt x heading loss grid plus the three-source loss range (R3-3)."""
+    return dem_slope.loss_range(
+        lat, tilts=list(tilts), diffuse_fraction=diffuse_fraction
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_site_list(image_dir: str):
+    """GeoTIFFs available as study sites, for the sidebar picker."""
+    import glob as _glob
+    return sorted(
+        _glob.glob(os.path.join(image_dir, "*.tif"))
+        + _glob.glob(os.path.join(image_dir, "*.tiff"))
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_dem_layers(dem_path: str, _mtime: float):
+    """Slope/aspect for a cropped DEM. `_mtime` busts the cache when it is rewritten."""
+    return dem_slope.load_slope_aspect(dem_path)
 
 
 def load_gemini_model(api_key: str):
@@ -437,6 +497,106 @@ def main():
                 min_value=1000, max_value=3000, value=1500, step=100,
             )
 
+            # Building type drives the usable-area ratio and the MCDA suitability
+            # score. It was previously taking the *panel* type by mistake, so every
+            # site fell through to the "unknown" bucket. A_usable is the direct input
+            # to the R3-2 module comparison, so it has to be selected explicitly.
+            building_type = st.selectbox(
+                "Building type",
+                options=["unknown", "residential", "commercial", "industrial", "mixed_use"],
+                index=0,
+                help=(
+                    "Sets the usable-area ratio (Res 0.40 / Com 0.60 / Ind 0.65 / "
+                    "Mixed 0.50 / Unknown 0.45) and the MCDA building score."
+                ),
+            )
+
+        # ── R3-2: module-specific power output ────────────────────────────────
+        with st.expander("🔆 Solar modules", expanded=False):
+            st.caption(
+                "Datasheet-based capacity, replacing the unspecified power density "
+                "P_D in Eq. (5)."
+            )
+            module_codes = st.multiselect(
+                "Modules to compare",
+                options=list(MODULES.keys()),
+                default=list(DEFAULT_COMPARISON),
+                format_func=lambda c: f"{c} — {MODULES[c].manufacturer} {MODULES[c].model}",
+            )
+            bin_policy = st.radio(
+                "Bin policy",
+                options=["top", "mid", "bottom"],
+                index=0, horizontal=True,
+                help="Applied to every manufacturer alike. Mixing bins biases the comparison.",
+            )
+            packing_factor = st.slider(
+                "Packing factor k", min_value=0.75, max_value=0.90, value=0.85, step=0.01,
+                help="Module area divided by usable area.",
+            )
+            system_losses = st.slider(
+                "System losses L_sys", min_value=0.05, max_value=0.25, value=0.14, step=0.01,
+                help=(
+                    "Soiling, mismatch, wiring, inverter. Excludes temperature, which "
+                    "is applied separately via gamma — do not double-count it."
+                ),
+            )
+            delta_t_cell = st.number_input(
+                "Cell temp above STC, ΔT (°C)",
+                min_value=0.0, max_value=45.0, value=27.0, step=1.0,
+                help="Irradiance-weighted (T_cell − 25). 27 °C reproduces the revision plan's table.",
+            )
+            h_poa = st.number_input(
+                "Annual POA irradiation (kWh/m²/yr)",
+                min_value=800.0, max_value=2400.0,
+                value=float(round(h_poa_from_psh(PEAK_SUN_HOURS), 1)), step=10.0,
+            )
+
+        # ── R3-3: slope & orientation (limitation only) ───────────────────────
+        with st.expander("⛰️ Slope & DEM", expanded=False):
+            st.caption(
+                "Terrain slope from the 12.5 m DEM, plus a roof-pitch scenario grid. "
+                "Scoped as a limitation, so it does not change headline energy."
+            )
+            site_image_dir = st.text_input("Site imagery folder", value=SITE_IMAGE_DIR)
+            dem_src_dir = st.text_input("Province DEM folder", value=dem_slope.DEFAULT_DEM_DIR)
+            dem_out_dir = st.text_input("Cropped DEM output", value=dem_slope.DEFAULT_DEM_OUT_DIR)
+            dem_buffer_m = st.number_input(
+                "Crop buffer (m)", min_value=0.0, max_value=500.0, value=50.0, step=10.0,
+                help="Margin so the 3×3 slope kernel has real neighbours at the tile edge.",
+            )
+            dem_derivatives = st.checkbox("Also write slope/aspect rasters", value=True)
+            diffuse_fraction = st.slider(
+                "Diffuse fraction (clear-sky model)",
+                min_value=0.20, max_value=0.65, value=0.35, step=0.05,
+                help="Humid-tropics default. Lower values widen the modelled orientation spread.",
+            )
+            st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+            assumed_pitch_deg = st.slider(
+                "Assumed roof pitch (°)", min_value=0.0, max_value=45.0, value=30.0, step=5.0,
+                help=(
+                    "The 12.5 m DEM cannot resolve roof pitch, so it is an assumption. "
+                    "About 30° is typical for Indonesian residential roofs [C1]; 0° "
+                    "suits flat institutional roofs."
+                ),
+            )
+            assumed_heading = st.selectbox(
+                "Assumed roof heading", options=list(dem_slope.COMPASS.keys()), index=0,
+                help="Degrees from north, clockwise. On Java, north faces the equator.",
+            )
+            fallback_lat = st.number_input(
+                "Latitude fallback (°)", min_value=-11.0, max_value=6.0,
+                value=-7.0, step=0.1,
+                help="Used only when the image carries no CRS to derive latitude from.",
+            )
+            apply_orientation = st.checkbox(
+                "Apply orientation correction to energy",
+                value=False,
+                help=(
+                    "OFF keeps the paper's headline numbers unchanged, which is what "
+                    "'Limitation only' means. Turn ON only for what-if runs."
+                ),
+            )
+
         # ── System status ─────────────────────────────────────────────────────
         with st.expander("🖥️ System", expanded=False):
             if torch.cuda.is_available():
@@ -473,18 +633,55 @@ def main():
     # STEP 1 — UPLOAD
     # =========================================================================
 
-    _section("Step 1 — Upload Image")
+    _section("Step 1 — Select or Upload Image")
 
-    uploaded_file = st.file_uploader(
-        "Upload an aerial or satellite image. GeoTIFF recommended for accurate measurements.",
-        type=["png", "jpg", "jpeg", "tif", "tiff"],
+    # Two ways in. The study-site picker reads straight off disk, which keeps the real
+    # filename and path -- the DEM crop (R3-3) needs both to name its output and to
+    # locate the tile on the province DEM. Uploads still work, but land in a tempfile.
+    site_files = _cached_site_list(site_image_dir)
+    src_tab, up_tab = st.tabs(
+        [f"Study sites ({len(site_files)})", "Upload"]
     )
 
-    if uploaded_file:
-        image_pil, geotiff_handler = load_image_with_geotiff_support(uploaded_file)
-        st.session_state.uploaded_image  = image_pil
-        st.session_state.geotiff_handler = geotiff_handler
+    uploaded_file = None
+    picked_site = None
 
+    with src_tab:
+        if site_files:
+            picked_site = st.selectbox(
+                "Site",
+                options=[None] + site_files,
+                format_func=lambda f: "— select —" if f is None else os.path.basename(f),
+                help=f"GeoTIFFs found in {site_image_dir}",
+            )
+        else:
+            st.info(
+                f"No GeoTIFFs in `{site_image_dir}`. "
+                "Change the folder under **Slope & DEM** in the sidebar, "
+                "or use the Upload tab."
+            )
+
+    with up_tab:
+        uploaded_file = st.file_uploader(
+            "Upload an aerial or satellite image. GeoTIFF recommended for accurate measurements.",
+            type=["png", "jpg", "jpeg", "tif", "tiff"],
+        )
+
+    if picked_site:
+        geotiff_handler = GeoTIFFHandler.from_path(picked_site)
+        image_pil = geotiff_handler.get_image_as_pil()
+        st.session_state.uploaded_image   = image_pil
+        st.session_state.geotiff_handler  = geotiff_handler
+        st.session_state.site_image_path  = picked_site
+    elif uploaded_file:
+        image_pil, geotiff_handler = load_image_with_geotiff_support(uploaded_file)
+        st.session_state.uploaded_image   = image_pil
+        st.session_state.geotiff_handler  = geotiff_handler
+        # A tempfile copy has no stable path, so DEM cropping is unavailable for
+        # uploads; the Slope tab says so rather than failing at the button.
+        st.session_state.site_image_path  = None
+
+    if picked_site or uploaded_file:
         if geotiff_handler and geotiff_handler.is_geotiff:
             meta = geotiff_handler.metadata
             c1, c2, c3, c4 = st.columns(4)
@@ -664,7 +861,7 @@ def main():
         )
 
         # ── Usable area suitability ───────────────────────────────────────────
-        usability_result = calculate_usable_area(roof_area_m2, building_type=panel_type)
+        usability_result = calculate_usable_area(roof_area_m2, building_type=building_type)
         usable_area_m2   = usability_result["usable_area_m2"]
 
         # ── Economics — current panels ────────────────────────────────────────
@@ -726,7 +923,7 @@ def main():
             scenarios_economic=scenarios,
             usable_area_m2=usable_area_m2,
             irradiance_kwh_m2_day=irradiance,
-            building_type=panel_type,
+            building_type=building_type,
             near_grid=True,
             road_access=True,
         )
@@ -763,15 +960,50 @@ def main():
             electricity_rate,
         )
 
+        # ── R3-3 inputs shared by the Module Output and Slope tabs ────────────
+        _handler = st.session_state.geotiff_handler
+        _lat = getattr(_handler, "lat_center", None) if _handler else None
+        site_lat = float(_lat) if _lat is not None else float(fallback_lat)
+
+        # 1.0 unless the user explicitly opts in: R3-3 is scoped as a limitation, so
+        # the headline energy and economics must stay exactly as the paper reports.
+        orientation_factor = 1.0
+        if apply_orientation:
+            orientation_factor = dem_slope.poa_factor(
+                site_lat,
+                assumed_pitch_deg,
+                dem_slope.COMPASS[assumed_heading],
+                diffuse_fraction=diffuse_fraction,
+            )
+
+        yield_assumptions = YieldAssumptions(
+            packing_factor=packing_factor,
+            h_poa_kwh_m2_yr=h_poa,
+            delta_t_cell_c=delta_t_cell,
+            system_losses=system_losses,
+            bin_policy=bin_policy,
+            orientation_factor=orientation_factor,
+        )
+        a_usable_m2 = float(usability_result["usable_area_m2"])
+        module_df = compare_modules(
+            a_usable_m2,
+            codes=module_codes or None,
+            assumptions=yield_assumptions,
+            annual_demand_kwh=consumption_annual_kwh or None,
+        )
+        st.session_state.module_table = module_df
+
         # =====================================================================
         # TABS
         # =====================================================================
 
-        (tab_detect, tab_energy, tab_usability,
+        (tab_detect, tab_energy, tab_modules, tab_slope, tab_usability,
          tab_district, tab_spatial, tab_econ,
          tab_ai, tab_export) = st.tabs([
             "Detection",
             "Energy",
+            "Module Output",        # R3-2
+            "Slope & Orientation",  # R3-3
             "Usable Area",
             "District Analysis",
             "Spatial Recommendation",
@@ -879,8 +1111,341 @@ def main():
             c2.metric("Cost with Solar",      f"Rp {pln_comparison['annual_cost_with_solar_million_rp']:.2f}M/yr")
             c3.metric("Self-sufficiency",     f"{pln_comparison['self_sufficiency_pct']:.1f}%")
 
+        # ---------------------------------------------------------------------
+        # TAB 3 - Module Output (R3-2)
+        # ---------------------------------------------------------------------
+        with tab_modules:
+
+            st.caption(
+                "Datasheet-based capacity and yield for six commercially available "
+                "modules. Every figure traces to a published datasheet rather "
+                "than to an assumed power density."
+            )
+
+            if module_df.empty:
+                st.warning(
+                    "No modules selected, or none of the selected modules publishes a "
+                    f"**{bin_policy}** bin. Pick modules in the sidebar, or switch the "
+                    "bin policy to top."
+                )
+            else:
+                skipped = skipped_for_bin(module_codes or None, bin_policy)
+                if skipped:
+                    st.info(
+                        f"Excluded under the **{bin_policy}** bin policy because the "
+                        f"datasheet gives no lower bin: {', '.join(skipped)}. They are "
+                        "skipped rather than substituted, so the bin policy stays "
+                        "uniform across manufacturers."
+                    )
+
+                _section("Inputs")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("A_usable", f"{a_usable_m2:,.1f} m²",
+                          help="Taken from the Usable Area tab. Never hard-coded.")
+                c2.metric("Packing factor k", f"{packing_factor:.2f}")
+                c3.metric("POA irradiation", f"{h_poa:,.0f} kWh/m²/yr")
+                c4.metric("ΔT above STC", f"{delta_t_cell:.0f} °C")
+
+                if orientation_factor != 1.0:
+                    st.warning(
+                        f"Orientation correction is ON: POA scaled by "
+                        f"{orientation_factor:.3f} for a {assumed_pitch_deg:.0f}° roof "
+                        f"facing {assumed_heading}. These are what-if numbers, not the "
+                        "paper's headline figures."
+                    )
+
+                _section("Module comparison (IV.B)")
+                show_cols = [
+                    "code", "model", "cell_tech", "pmax_w", "eta_pct", "gamma_pmax",
+                    "n_modules", "capacity_kwp", "annual_mwh", "kwh_per_kwp",
+                    "kwh_per_m2", "temp_loss_pct", "lifetime_mwh",
+                ]
+                st.dataframe(
+                    module_df[[c for c in show_cols if c in module_df.columns]],
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "code": "Ref", "model": "Module", "cell_tech": "Cell tech",
+                        "pmax_w": st.column_config.NumberColumn("Pmax (W)", format="%d"),
+                        "eta_pct": st.column_config.NumberColumn("Eff (%)", format="%.2f"),
+                        "gamma_pmax": st.column_config.NumberColumn("Gamma (%/°C)", format="%.3f"),
+                        "n_modules": st.column_config.NumberColumn("N", format="%d"),
+                        "capacity_kwp": st.column_config.NumberColumn("kWp", format="%.1f"),
+                        "annual_mwh": st.column_config.NumberColumn("MWh/yr", format="%.1f"),
+                        "kwh_per_kwp": st.column_config.NumberColumn("kWh/kWp", format="%.0f"),
+                        "kwh_per_m2": st.column_config.NumberColumn("kWh/m²", format="%.1f"),
+                        "temp_loss_pct": st.column_config.NumberColumn("Temp loss (%)", format="%.1f"),
+                        "lifetime_mwh": st.column_config.NumberColumn("25-yr MWh", format="%.0f"),
+                    },
+                )
+
+                spread = spread_summary(module_df)
+                st.markdown(
+                    _pill(
+                        f"Module choice moves capacity by {spread['capacity_spread_pct']:.1f}% "
+                        f"({spread['capacity_min_kwp']:,.0f}-{spread['capacity_max_kwp']:,.0f} kWp) "
+                        f"on the same roof; the temperature-loss gap is only "
+                        f"{spread['temp_loss_spread_pp']:.1f} pp",
+                        "green",
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+                _section("The optimum depends on the objective")
+                picks = best_modules(module_df, consumption_annual_kwh or None)
+                for key, info in picks.items():
+                    st.markdown(
+                        f"**{info['code']} - {info['model']}**  \n"
+                        f"<span style='color:#64748b;font-size:0.85rem'>{info['why']}</span>",
+                        unsafe_allow_html=True,
+                    )
+                st.caption(
+                    "Six fully specified options is a small discrete set, so exhaustive "
+                    "enumeration finds the exact optimum and keeps every number traceable "
+                    "to a datasheet. No machine learning is needed here; it would only "
+                    "help for inferring roof geometry that the imagery does not give."
+                )
+
+                _section("Capacity by module")
+                st.bar_chart(
+                    module_df.set_index("code")["capacity_kwp"],
+                    use_container_width=True,
+                )
+
+                with st.expander("Packing-factor sensitivity (k = 0.75 to 0.90)"):
+                    sens = packing_sensitivity(
+                        a_usable_m2, module_codes or None, yield_assumptions
+                    )
+                    st.dataframe(sens, use_container_width=True, hide_index=True)
+
+                with st.expander("Degradation over 25 years"):
+                    curves = {}
+                    for _, r in module_df.iterrows():
+                        mod = get_module(str(r["code"]))
+                        curves[str(r["code"])] = [
+                            v / 1000.0
+                            for v in annual_energy_series(float(r["annual_kwh"]), mod, 25)
+                        ]
+                    st.line_chart(
+                        pd.DataFrame(curves, index=range(1, 26)),
+                        use_container_width=True,
+                    )
+                    st.caption(
+                        "MWh/yr. Compound decay per Revision Plan 2.1; manufacturers print "
+                        "linear warranty figures, so these sit slightly above the datasheet "
+                        "end-of-life percentages."
+                    )
+
+                issues = catalogue_issues(bin_policy)
+                if issues:
+                    with st.expander(f"Datasheet cells still to verify ({len(issues)})"):
+                        for it in issues:
+                            st.markdown(f"- {it}")
+                        st.caption(
+                            "Confirm each against the manufacturer PDF and archive it "
+                            "before these numbers go into the manuscript."
+                        )
+
+                with st.expander("IEEE citations for the datasheets"):
+                    for i, code in enumerate(module_df["code"], start=1):
+                        st.code(citation(get_module(str(code)), str(i)), language=None)
+
+                st.download_button(
+                    "Download module comparison (CSV)",
+                    data=module_df.to_csv(index=False).encode("utf-8"),
+                    file_name="module_comparison.csv",
+                    mime="text/csv",
+                    key="dl_modules_csv",
+                )
+
+        # ---------------------------------------------------------------------
+        # TAB 4 - Slope & Orientation (R3-3, limitation only)
+        # ---------------------------------------------------------------------
+        with tab_slope:
+
+            st.caption(
+                "Quantifies how much ignoring roof pitch and heading could be worth. "
+                "Reported as a limitation: it does not change the headline energy "
+                "estimate unless you opt in below."
+            )
+
+            st.info(
+                "**What the DEM can and cannot measure.** The PALSAR DEM is 12.5 m and "
+                "each site tile is 200 m across, so a tile spans about **16 x 16 DEM "
+                "cells** and one roof covers 1-2 of them. That resolves *terrain* slope, "
+                "not roof pitch (about 30°). Resampling to the imagery's 10 cm grid "
+                "would not create pitch information that is absent from the source."
+            )
+
+            _section("1 - Cropped DEM")
+            site_path = st.session_state.site_image_path
+            dem_summary = None
+
+            if not site_path:
+                st.warning(
+                    "DEM cropping needs a file path. Pick a site under **Study sites** "
+                    "in Step 1; uploads are copied to a temporary file and have no "
+                    "stable path. You can also run `python prepare_dem.py` to crop "
+                    "every site at once."
+                )
+            else:
+                st.caption(f"Site raster: {site_path}")
+                if st.button("Crop DEM for this site", type="primary", key="btn_crop_dem"):
+                    with st.spinner("Locating the province DEM and reprojecting..."):
+                        try:
+                            st.session_state.dem_provenance = dem_slope.crop_dem_for_image(
+                                site_path,
+                                dem_dir=dem_src_dir,
+                                out_dir=dem_out_dir,
+                                buffer_m=dem_buffer_m,
+                                write_derivatives=dem_derivatives,
+                            )
+                            st.success("Cropped DEM written.")
+                        except Exception as exc:
+                            st.session_state.dem_provenance = None
+                            st.error(f"DEM crop failed: {exc}")
+
+            prov = st.session_state.dem_provenance
+            _site_stem = os.path.splitext(os.path.basename(site_path))[0] if site_path else None
+            if prov and prov.get("site") == _site_stem:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Native cells over tile",
+                          f"{prov['native_cells_x']:.0f} x {prov['native_cells_y']:.0f}")
+                c2.metric("Effective resolution", f"{prov['effective_resolution_m']:.1f} m")
+                c3.metric("Source DEM", prov["source_dem"][:18])
+                c4.metric("Nodata", f"{prov['nodata_fraction']*100:.1f} %")
+
+                if prov["reprojected"]:
+                    st.markdown(
+                        _pill(f"Reprojected {prov['source_crs']} to {prov['target_crs']}", "yellow"),
+                        unsafe_allow_html=True,
+                    )
+                st.caption(f"Written to {prov['dem_path']}")
+
+                layers = None
+                try:
+                    layers = _cached_dem_layers(
+                        prov["dem_path"], os.path.getmtime(prov["dem_path"])
+                    )
+                    dem_summary = dem_slope.terrain_summary(layers)
+                except Exception as exc:
+                    st.error(f"Could not read the cropped DEM: {exc}")
+
+                if dem_summary and dem_summary.get("available"):
+                    _section("2 - Measured terrain (not roof pitch)")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Median slope", f"{dem_summary['slope_median_deg']:.2f}°")
+                    c2.metric("Max slope", f"{dem_summary['slope_max_deg']:.2f}°")
+                    c3.metric("Relief", f"{dem_summary['relief_m']:.1f} m")
+                    c4.metric("Flat cells", f"{dem_summary['flat_fraction']*100:.0f} %")
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.caption("Terrain slope (°)")
+                        sl = np.nan_to_num(layers["slope"], nan=0.0)
+                        rng = float(sl.max() - sl.min())
+                        norm = (sl - sl.min()) / rng if rng > 1e-9 else np.zeros_like(sl)
+                        st.image(norm.astype("float32"), use_container_width=True, clamp=True)
+                    with c2:
+                        st.caption("Terrain aspect (° from north)")
+                        asp = np.nan_to_num(layers["aspect"], nan=0.0) / 360.0
+                        st.image(asp.astype("float32"), use_container_width=True, clamp=True)
+
+                    if roof_segments and st.session_state.geotiff_handler is not None:
+                        with st.expander(f"Per-roof terrain ({len(roof_segments)} segments)"):
+                            try:
+                                zt = dem_slope.zonal_terrain(
+                                    roof_segments,
+                                    st.session_state.geotiff_handler.transform,
+                                    layers,
+                                )
+                                st.dataframe(
+                                    pd.DataFrame(zt), use_container_width=True, hide_index=True
+                                )
+                                st.caption(
+                                    "Sampled at each roof centroid. Because a roof spans "
+                                    "1-2 DEM cells, neighbouring roofs often share a value."
+                                )
+                            except Exception as exc:
+                                st.warning(f"Per-roof sampling unavailable: {exc}")
+            elif site_path:
+                st.caption("No cropped DEM for this site yet.")
+
+            _section("3 - Roof pitch and heading scenarios")
+            st.caption(
+                f"Latitude {site_lat:.3f}°. Loss is measured against the optimum-tilt, "
+                "equator-facing surface that the irradiation input assumes [E5]."
+            )
+
+            lr = _cached_orientation(
+                round(site_lat, 4),
+                tuple(dem_slope.DEFAULT_PITCH_SCENARIOS),
+                diffuse_fraction,
+            )
+            grid = lr["analytic"]["grid"]
+            st.dataframe(grid.round(1), use_container_width=True)
+            st.caption(
+                "Loss in % against the optimum-tilt reference. Rows are roof pitch in "
+                "degrees, columns are headings."
+            )
+
+            _section("4 - Loss range for the Limitation paragraph")
+            lo, hi = lr["analytic"]["total_loss_pct"]
+            worst = lr["analytic"]["worst_case"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric(
+                "Literature (cite this)",
+                f"{lr['literature']['orientation_spread_pct']:.1f} pp",
+                help=lr["literature"]["note"],
+            )
+            c2.metric(
+                "Clear-sky grid (screening)",
+                f"{lr['analytic']['orientation_spread_pct']:.1f} pp",
+                help=lr["analytic"]["caveat"],
+            )
+            c3.metric(
+                "Worst case vs reference",
+                f"{hi:.1f} %",
+                help=f"{worst['tilt_deg']:.0f}° pitch facing {worst['heading']}",
+            )
+
+            st.warning(
+                "Use the **literature** figure in IV.D. The clear-sky grid recovers only "
+                "about two thirds of the measured spread, and Revision Plan 10 warns "
+                "against reporting offline weather numbers. "
+                + ("pvlib is not installed, so no TMY-based figure is available."
+                   if not lr["pvlib"].get("available") else "")
+            )
+
+            with st.expander("Evidence and citations"):
+                for key, anchor in lr["literature"]["anchors"].items():
+                    st.markdown(f"**{key}** - {anchor['description']}")
+                    st.code(anchor["citation"], language=None)
+
+            with st.expander("Copy-ready facts for IV.D"):
+                st.text_area(
+                    "Facts, not prose",
+                    value=dem_slope.limitation_sentence(
+                        site_lat,
+                        dem_summary if dem_summary and dem_summary.get("available") else None,
+                        diffuse_fraction=diffuse_fraction,
+                    ),
+                    height=190,
+                )
+                st.caption(
+                    "Deliberately a list of numbers rather than finished sentences, so the "
+                    "paragraph can be written in your own words."
+                )
+
+            st.download_button(
+                "Download orientation grid (CSV)",
+                data=grid.to_csv().encode("utf-8"),
+                file_name="orientation_grid.csv",
+                mime="text/csv",
+                key="dl_orientation_csv",
+            )
+
         # ─────────────────────────────────────────────────────────────────────
-        # TAB 3 — Usable Area Suitability
+        # TAB 5 — Usable Area Suitability
         # ─────────────────────────────────────────────────────────────────────
         with tab_usability:
 
@@ -949,7 +1514,7 @@ def main():
                 )
 
         # ─────────────────────────────────────────────────────────────────────
-        # TAB 4 — District Analysis
+        # TAB 6 — District Analysis
         # ─────────────────────────────────────────────────────────────────────
         with tab_district:
 
@@ -1018,7 +1583,7 @@ def main():
                     st.markdown(f"- {ref}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # TAB 5 — Spatial Recommendation
+        # TAB 7 — Spatial Recommendation
         # ─────────────────────────────────────────────────────────────────────
         with tab_spatial:
 
@@ -1173,7 +1738,7 @@ def main():
             )
 
         # ─────────────────────────────────────────────────────────────────────
-        # TAB 6 — Economics
+        # TAB 8 — Economics
         # ─────────────────────────────────────────────────────────────────────
         with tab_econ:
 
@@ -1254,7 +1819,7 @@ def main():
             st.dataframe(df_scen, use_container_width=True, hide_index=True)
 
         # ─────────────────────────────────────────────────────────────────────
-        # TAB 7 — AI Analysis
+        # TAB 9 — AI Analysis
         # ─────────────────────────────────────────────────────────────────────
         with tab_ai:
 
@@ -1366,7 +1931,7 @@ Answer in English. Be specific with numbers. Keep it concise.
                         st.rerun()
 
         # ─────────────────────────────────────────────────────────────────────
-        # TAB 8 — Export
+        # TAB 10 — Export
         # ─────────────────────────────────────────────────────────────────────
         with tab_export:
 
@@ -1463,6 +2028,12 @@ Answer in English. Be specific with numbers. Keep it concise.
             st.divider()
             _section("Full Analysis Report")
 
+            _report_lr = _cached_orientation(
+                round(site_lat, 4),
+                tuple(dem_slope.DEFAULT_PITCH_SCENARIOS),
+                diffuse_fraction,
+            )
+
             report = {
                 "app":     "EcoPower Roof",
                 "version": "3.0.0",
@@ -1482,6 +2053,45 @@ Answer in English. Be specific with numbers. Keep it concise.
                 "economics_capped":    convert_to_serializable(economics_capped),
                 "spatial_scores":      convert_to_serializable(spatial_scores),
                 "pln_comparison":      convert_to_serializable(pln_comparison),
+                # R3-2: datasheet-based module comparison (IV.B)
+                "module_comparison": {
+                    "assumptions":   convert_to_serializable(yield_assumptions.as_dict()),
+                    "a_usable_m2":   float(a_usable_m2),
+                    "bin_policy":    bin_policy,
+                    "skipped_modules": skipped_for_bin(module_codes or None, bin_policy),
+                    "table":         convert_to_serializable(
+                                         module_df.to_dict(orient="records")
+                                     ) if not module_df.empty else [],
+                    "spread":        convert_to_serializable(spread_summary(module_df))
+                                     if not module_df.empty else {},
+                    "best_by_objective": convert_to_serializable(
+                                         best_modules(module_df, consumption_annual_kwh or None)
+                                     ) if not module_df.empty else {},
+                    "unverified_cells": catalogue_issues(bin_policy),
+                },
+                # R3-3: slope and orientation limitation (IV.D)
+                "slope_orientation": {
+                    "latitude":              float(site_lat),
+                    "diffuse_fraction":      float(diffuse_fraction),
+                    "orientation_applied":   bool(apply_orientation),
+                    "orientation_factor":    float(orientation_factor),
+                    "assumed_pitch_deg":     float(assumed_pitch_deg),
+                    "assumed_heading":       assumed_heading,
+                    "analytic_total_loss_pct":       list(_report_lr["analytic"]["total_loss_pct"]),
+                    "analytic_orientation_spread_pp": float(
+                        _report_lr["analytic"]["orientation_spread_pct"]),
+                    "analytic_worst_case":   convert_to_serializable(
+                                                 _report_lr["analytic"]["worst_case"]),
+                    "literature_spread_pp":  float(
+                        _report_lr["literature"]["orientation_spread_pct"]),
+                    "recommended_source":    "literature",
+                    "grid_loss_pct":         convert_to_serializable(
+                                                 _report_lr["analytic"]["grid"].to_dict()),
+                    "direction_of_bias":     _report_lr["direction_of_bias"],
+                },
+                "dem_provenance": convert_to_serializable(
+                    st.session_state.dem_provenance or {}
+                ),
             }
 
             st.download_button(
@@ -1491,6 +2101,32 @@ Answer in English. Be specific with numbers. Keep it concise.
                 mime      = "application/json",
                 key       = "dl_json_report",
             )
+
+            _section("Revision Tables (CSV)")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    "Module comparison",
+                    data=(module_df.to_csv(index=False) if not module_df.empty else "").encode("utf-8"),
+                    file_name="module_comparison.csv",
+                    mime="text/csv",
+                    disabled=module_df.empty,
+                    use_container_width=True,
+                    key="dl_modules_csv_export",
+                )
+            with c2:
+                st.download_button(
+                    "Orientation grid",
+                    data=_report_lr["analytic"]["grid"].to_csv().encode("utf-8"),
+                    file_name="orientation_grid.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="dl_orientation_csv_export",
+                )
+            if st.session_state.dem_provenance:
+                st.caption(
+                    f"Cropped DEM on disk: {st.session_state.dem_provenance['dem_path']}"
+                )
 
     # =========================================================================
     # FOOTER

@@ -10,6 +10,11 @@ from typing import Dict, Tuple
 PSH_SEMARANG = 5.0  # Peak Sun Hours per day
 PERFORMANCE_RATIO = 0.80  # System efficiency
 PANEL_POWER_WP = 400  # Watts peak per panel (typical)
+# LEGACY. This is the draft's unspecified power density P_D from Eq. (5), and the
+# repo carries three different values for it (0.15 here, 0.20 in economics.py and
+# usable_area_suitability.py, 200 W/m2 in district_analysis.py). Revision Plan 5.1
+# flags exactly this. Prefer power_density_kwp_m2() below, which derives P_D from a
+# named manufacturer datasheet. The constant is kept so existing results reproduce.
 PANEL_EFFICIENCY = 0.15  # kWp per m² (15%)
 DAILY_CONSUMPTION_PER_BUILDING = 4.5  # kWh/day (from research)
 CO2_REDUCTION_FACTOR = 0.5  # kg CO2 per kWh
@@ -240,3 +245,25 @@ def estimate_roof_area_from_pixels(
     pixel_count = np.sum(mask > 0)
     area_m2 = pixel_count * (pixel_to_meter_ratio ** 2)
     return area_m2
+
+
+def power_density_kwp_m2(
+    module_code: str = "F1",
+    bin_policy: str = "top",
+    packing_factor: float = 0.85,
+) -> float:
+    """Datasheet-traceable replacement for ``PANEL_EFFICIENCY`` (R3-2).
+
+    Returns kWp per m2 of *usable roof area* for one catalogue module, so Eq. (5)'s
+    ``P_D`` can be cited to a manufacturer PDF instead of being an unsourced constant.
+
+    >>> round(power_density_kwp_m2("F5"), 4)   # AIKO Neostar 3N54, top bin
+    0.2106
+
+    Not wired in as a default anywhere: swapping it in changes published capacity
+    figures, so the caller opts in deliberately.
+    """
+    from .module_yield import power_density_kwp_m2 as _pd
+    from .pv_modules import get_module
+
+    return _pd(get_module(module_code), bin_policy, packing_factor)

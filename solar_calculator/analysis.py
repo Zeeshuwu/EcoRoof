@@ -3,6 +3,10 @@ Gemini AI analysis integration
 """
 
 import google.generativeai as genai
+
+# Single source of truth for the emission factor. The prompt used to hard-code
+# 0.87 while every constant in the codebase said 0.85 (Revision Plan 5.3).
+from .economics import CO2_EMISSION_FACTOR
 from typing import Dict, Optional
 from PIL import Image
 
@@ -22,6 +26,8 @@ def analyze_with_gemini(
     SAM3 multi-level patch segmentation → usable area reduction →
     PV potential estimation → economic feasibility → spatial recommendation.
     """
+
+    co2_factor = CO2_EMISSION_FACTOR
 
     prompt = f"""
 You are a solar energy research analyst contributing to the EcoPower Roof project,
@@ -145,7 +151,7 @@ the project meets the economic viability threshold.
 
 ## 5. CO₂ & Environmental Impact
 Quantify annual carbon reduction from the detected panel area.
-Contextualize against the Indonesian grid emission factor of 0.87 kg CO₂/kWh (PLN, 2022).
+Contextualize against the Indonesian grid emission factor of {co2_factor} kg CO₂/kWh.
 Relate this to Indonesia's 3,294 GW untapped solar potential and national
 decarbonization targets.
 
