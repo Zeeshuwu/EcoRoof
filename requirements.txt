@@ -5,10 +5,10 @@ torchvision
 torchaudio
 
 # --- TRITON (KHUSUS WINDOWS & PYTHON 3.12) ---
-# Link langsung ke file .whl (bukan hasil search google)
+
 https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post5/triton-3.1.0-cp312-cp312-win_amd64.whl
 
-# --- LIBRARY UTAMA SAM 3 ---
+
 numpy==1.26.4
 opencv-python
 pillow
@@ -18,7 +18,7 @@ huggingface_hub
 scipy
 pandas
 
-# --- MODUL TAMBAHAN ---
+
 einops
 decord
 psutil
