@@ -1,19 +1,5 @@
 #!/usr/bin/env python
-"""
-Figures for R2-1: the hierarchical-vs-single-level ablation.
 
-    python make_r2_figures.py
-
-Writes into `figures/`:
-
-    Fig_R2_ablation_boxplot.png   building-level IoU by configuration, with the
-                                  Holm-adjusted significance brackets
-    Fig_R2_qualitative.png        the same rooftops under all four
-                                  configurations, so the statistics have a
-                                  visual counterpart
-
-Both are drawn at 300 dpi on a white ground, sized for a single IEEE column.
-"""
 
 import argparse
 import json
